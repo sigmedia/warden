@@ -7,7 +7,7 @@ Run [Claude Code](https://claude.ai) and [OpenAI Codex](https://developers.opena
 - Isolates Claude Code and Codex from your host system (`--security-opt no-new-privileges`)
 - Mounts host `/usr` ro so Claude can use your compilers, tools, and libraries
 - Shares Claude config across host and container
-- Optional extras: Node.js/ccstatusline, ccache, D-Bus (via `extra-build.sh` and `config`)
+- Optional extras: Node.js/ccstatusline, ccache (via `extra-build.sh` and `config`)
 
 ## What gets mounted
 
@@ -21,8 +21,9 @@ Always mounted by the script:
 | `~/.codex` | `~/.codex` | rw | Codex config (`config.toml`) and authentication (`auth.json`) |
 | `/usr` | `/usr` | ro | Host compilers, libraries, and tools (gcc, make, etc.) |
 | `/etc/alternatives` | `/etc/alternatives` | ro | Debian alternatives symlinks (auto-detected) |
+| Per-run `xdg-dbus-proxy` socket | `/run/user/$UID/bus` | rw | Desktop notifications only (when `xdg-dbus-proxy` is installed) |
 
-The default `config.in` also mounts ccstatusline, D-Bus session socket, and ccache. See [Configuration](#configuration) to customise.
+The default `config.in` also mounts ccstatusline and ccache. See [Configuration](#configuration) to customise.
 
 ## Extra build steps
 
@@ -45,7 +46,7 @@ cp config.in config
 vi config
 ```
 
-`config` lets you set `WORK_ROOT` and `EXTRA_DOCKER_ARGS` (an array of extra `docker run` flags). The defaults in `config.in` include mounts for ccstatusline, D-Bus, and ccache. If no `config` file exists, `config.in` is used as-is.
+`config` lets you set `WORK_ROOT` and `EXTRA_DOCKER_ARGS` (an array of extra `docker run` flags). The defaults in `config.in` include mounts for ccstatusline and ccache. If no `config` file exists, `config.in` is used as-is.
 
 For a one-off run, set `CLAUDE_DOCKER_EXTRA_ARGS` to whitespace-separated Docker flags:
 

@@ -11,10 +11,6 @@ EXTRA_DOCKER_ARGS=(
   # ccstatusline: share tmux/screen status bar config with host
   # -v "$HOME/.config/ccstatusline:$HOME/.config/ccstatusline"
 
-  # D-Bus: forward the user session bus so the container can send desktop notifications
-  # -v "/run/user/$(id -u)/bus:/run/user/$(id -u)/bus"
-  # -e "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus"
-
   # ccache: share compiler cache with host to speed up rebuilds
   # -v "$HOME/.cache/ccache:$HOME/.cache/ccache"
   # -e CCACHE_PATH="/usr/bin"

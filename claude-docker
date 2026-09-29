@@ -27,6 +27,33 @@ ALTERNATIVES=()
 [[ -f "$HOME/.claude.json" ]] || touch "$HOME/.claude.json"
 [[ -d "$HOME/.codex" ]] || mkdir -p "$HOME/.codex"
 
+# D-Bus: expose only desktop notifications from the host session bus, through a
+# filtering proxy. The full bus would let the container run host commands
+# (systemd --user, Flatpak HostCommand) and read the keyring. Use scoped
+# --call/--broadcast rules, not --talk: --talk opens every object on the
+# notification server's connection, which some desktops share with other services.
+DBUS_DOCKER_ARGS=()
+if [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] && command -v xdg-dbus-proxy >/dev/null &&
+   DBUS_PROXY_DIR="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/claude-docker-dbus.XXXXXX")"; then
+  trap 'rm -rf "$DBUS_PROXY_DIR"' EXIT
+  # The proxy writes one byte to the pipe when ready, and exits once this
+  # script (and docker) close the read end.
+  exec {DBUS_PROXY_FD}< <(exec xdg-dbus-proxy --fd=1 \
+    "$DBUS_SESSION_BUS_ADDRESS" "$DBUS_PROXY_DIR/bus" \
+    --filter \
+    --call=org.freedesktop.Notifications=org.freedesktop.Notifications.*@/org/freedesktop/Notifications \
+    --broadcast=org.freedesktop.Notifications=org.freedesktop.Notifications.*@/org/freedesktop/Notifications)
+  if read -r -n 1 -t 5 -u "$DBUS_PROXY_FD" && [[ -S $DBUS_PROXY_DIR/bus ]]; then
+    DBUS_DOCKER_ARGS=(
+      -v "$DBUS_PROXY_DIR/bus:/run/user/$(id -u)/bus"
+      -e "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus"
+    )
+  else
+    exec {DBUS_PROXY_FD}<&-
+    echo "Warning: xdg-dbus-proxy did not start; desktop notifications disabled" >&2
+  fi
+fi
+
 # Per-run Docker options. Split on whitespace without evaluating shell syntax.
 ENV_DOCKER_ARGS=()
 if [[ -n ${CLAUDE_DOCKER_EXTRA_ARGS:-} ]]; then
@@ -49,6 +76,7 @@ docker --context rootless run -it --rm --security-opt no-new-privileges \
   -v "$HOME/.agents:$HOME/.agents" \
   -v /usr:/usr:ro \
   "${ALTERNATIVES[@]}" \
+  "${DBUS_DOCKER_ARGS[@]}" \
   "${EXTRA_DOCKER_ARGS[@]}" \
   "${ENV_DOCKER_ARGS[@]}" \
   "${CMD[@]}" claude-docker "$@"
