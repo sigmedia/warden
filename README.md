@@ -47,6 +47,14 @@ vi config
 
 `config` lets you set `WORK_ROOT` and `EXTRA_DOCKER_ARGS` (an array of extra `docker run` flags). The defaults in `config.in` include mounts for ccstatusline, D-Bus, and ccache. If no `config` file exists, `config.in` is used as-is.
 
+For a one-off run, set `CLAUDE_DOCKER_EXTRA_ARGS` to whitespace-separated Docker flags:
+
+```bash
+CLAUDE_DOCKER_EXTRA_ARGS='-p 8554-8556:8554-8556' claude-docker
+```
+
+These flags are added after `EXTRA_DOCKER_ARGS` and before the image name. The variable is split on whitespace; shell quotes and expansions inside its value are not interpreted. Use the `EXTRA_DOCKER_ARGS` array in `config` for arguments containing spaces. The `-p` example publishes ports on host interfaces, so only use it when that exposure is intended.
+
 ## Setup
 
 ```bash

@@ -27,6 +27,16 @@ ALTERNATIVES=()
 [[ -f "$HOME/.claude.json" ]] || touch "$HOME/.claude.json"
 [[ -d "$HOME/.codex" ]] || mkdir -p "$HOME/.codex"
 
+# Per-run Docker options. Split on whitespace without evaluating shell syntax.
+ENV_DOCKER_ARGS=()
+if [[ -n ${CLAUDE_DOCKER_EXTRA_ARGS:-} ]]; then
+  if [[ $CLAUDE_DOCKER_EXTRA_ARGS == *$'\n'* ]]; then
+    echo "Error: CLAUDE_DOCKER_EXTRA_ARGS must be a single line" >&2
+    exit 1
+  fi
+  IFS=$' \t\n' read -r -a ENV_DOCKER_ARGS <<< "$CLAUDE_DOCKER_EXTRA_ARGS"
+fi
+
 docker --context rootless run -it --rm --security-opt no-new-privileges \
   --user 0:0 \
   -e HOME="$HOME" \
@@ -40,4 +50,5 @@ docker --context rootless run -it --rm --security-opt no-new-privileges \
   -v /usr:/usr:ro \
   "${ALTERNATIVES[@]}" \
   "${EXTRA_DOCKER_ARGS[@]}" \
+  "${ENV_DOCKER_ARGS[@]}" \
   "${CMD[@]}" claude-docker "$@"
