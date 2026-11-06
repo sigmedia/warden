@@ -1,7 +1,12 @@
-ARG BASE_IMAGE
+ARG BASE_IMAGE=ubuntu:jammy
+FROM node:24-bookworm-slim AS node-tools
+RUN npm install --global ccstatusline@2.2.32
+
 FROM ${BASE_IMAGE}
 
-ARG PACKAGES="curl ca-certificates"
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG PACKAGES="curl ca-certificates git unzip"
 RUN if command -v apt-get >/dev/null; then \
       apt-get update && apt-get install -y --no-install-recommends $PACKAGES && \
       apt-get clean && rm -rf /var/lib/apt/lists/*; \
@@ -10,6 +15,12 @@ RUN if command -v apt-get >/dev/null; then \
     elif command -v apk >/dev/null; then \
       apk add --no-cache $PACKAGES; \
     fi
+
+# Keep Node.js and ccstatusline outside the host /usr bind mount.
+COPY --from=node-tools /usr/local/ /opt/node/
+RUN mkdir -p /etc/claude-code && \
+    printf '%s\n' '{"statusLine":{"type":"command","command":"/opt/node/bin/ccstatusline","padding":0}}' \
+      > /etc/claude-code/managed-settings.json
 
 ARG USER
 ARG UID=1000
@@ -36,5 +47,10 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 # defaults to the mounted ~/.codex for config/auth while the binary stays baked here.
 ARG CODEX_VERSION=1
 RUN curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_HOME=$HOME/.local/share/codex CODEX_NON_INTERACTIVE=1 sh
+
+ARG OPENCODE_VERSION=1
+RUN curl -fsSL https://opencode.ai/v2/install | bash -s -- --no-modify-path && \
+    mv "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" && \
+    opencode --version
 
 CMD ["claude"]

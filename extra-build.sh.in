@@ -4,11 +4,7 @@
 # 'extra-build.sh' is gitignored.
 set -e
 
-## Node.js 20 + ccstatusline (needed for npx ccstatusline)
-apt-get update && apt-get install -y --no-install-recommends xz-utils && apt-get clean && rm -rf /var/lib/apt/lists/*
-curl -fsSL https://nodejs.org/dist/v20.19.0/node-v20.19.0-linux-x64.tar.xz -o /tmp/node.tar.xz
-echo "b4e336584d62abefad31baecff7af167268be9bb7dd11f1297112e6eed3ca0d5  /tmp/node.tar.xz" | sha256sum -c -
-tar -xJ -C /opt --transform='s/^node-v20.19.0-linux-x64/node/' -f /tmp/node.tar.xz
-rm /tmp/node.tar.xz
-export PATH="/opt/node/bin:$PATH"
-npm install -g ccstatusline@latest
+# Node.js and ccstatusline are already installed by Dockerfile.
+# Add project-specific tools here, for example:
+# apt-get update && apt-get install -y --no-install-recommends ccache && \
+#   apt-get clean && rm -rf /var/lib/apt/lists/*
