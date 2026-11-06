@@ -1,102 +1,178 @@
-# claude-docker
+# claude-docker — `warden`
 
-Run [Claude Code](https://claude.ai) and [OpenAI Codex](https://developers.openai.com/codex) inside a Docker container with access to your host toolchain and working directory.
+`warden` runs [Claude Code](https://claude.ai), [Codex](https://developers.openai.com/codex)
+and [OpenCode](https://opencode.ai/v2/docs/) in a Docker container. The agent sees the
+current project and your host toolchain (`/usr`, read-only), and nothing else from your
+home directory except its own config.
 
-## Overview
-
-- Isolates Claude Code and Codex from your host system (`--security-opt no-new-privileges`)
-- Mounts host `/usr` ro so Claude can use your compilers, tools, and libraries
-- Shares Claude config across host and container
-- Optional extras: Node.js/ccstatusline, ccache (via `extra-build.sh` and `config`)
-
-## What gets mounted
-
-Always mounted by the script:
-
-| Host path | Container path | Mode | Why |
-|---|---|---|---|
-| `$WORK_ROOT` | `$WORK_ROOT` | rw | Project files Claude Code reads and edits |
-| `~/.claude` | `~/.claude` | rw | Claude Code config, memory, and project settings |
-| `~/.claude.json` | `~/.claude.json` | rw | Claude Code authentication and session state |
-| `~/.codex` | `~/.codex` | rw | Codex config (`config.toml`) and authentication (`auth.json`) |
-| `/usr` | `/usr` | ro | Host compilers, libraries, and tools (gcc, make, etc.) |
-| `/etc/alternatives` | `/etc/alternatives` | ro | Debian alternatives symlinks (auto-detected) |
-| Per-run `xdg-dbus-proxy` socket | `/run/user/$UID/bus` | rw | Desktop notifications only (when `xdg-dbus-proxy` is installed) |
-
-The default `config.in` also mounts ccstatusline and ccache. See [Configuration](#configuration) to customise.
-
-## Extra build steps
-
-To add packages or tools to the image, copy the template and uncomment what you need:
+## Quick start
 
 ```bash
-cp extra-build.sh.in extra-build.sh
-vi extra-build.sh
-./claude-docker-build
-```
+fish_add_path /path/to/claude-docker   # or add it to PATH in bash
+warden build
 
-For example, uncomment the Node.js lines to install Node.js 20 and ccstatusline. 
-
-## Configuration
-
-Copy the template and edit to taste:
-
-```bash
-cp config.in config
-vi config
-```
-
-`config` lets you set `WORK_ROOT` and `EXTRA_DOCKER_ARGS` (an array of extra `docker run` flags). The defaults in `config.in` include mounts for ccstatusline and ccache. If no `config` file exists, `config.in` is used as-is.
-
-For a one-off run, set `CLAUDE_DOCKER_EXTRA_ARGS` to whitespace-separated Docker flags:
-
-```bash
-CLAUDE_DOCKER_EXTRA_ARGS='-p 8554-8556:8554-8556' claude-docker
-```
-
-These flags are added after `EXTRA_DOCKER_ARGS` and before the image name. The variable is split on whitespace; shell quotes and expansions inside its value are not interpreted. Use the `EXTRA_DOCKER_ARGS` array in `config` for arguments containing spaces. The `-p` example publishes ports on host interfaces, so only use it when that exposure is intended.
-
-## Setup
-
-```bash
-# Build the image (uses your username automatically)
-./claude-docker-build
-
-# Full rebuild (no cache)
-./claude-docker-build --full
-
-# Setup ccstatusline (tmux/screen status bar integration)
-./claude-docker-npx ccstatusline@latest
+cd ~/work/my-project
+warden claude
 ```
 
 ## Usage
 
-Run from anywhere under `~/work`:
-
 ```bash
-cd ~/work/my-project
-claude-docker          # starts Claude Code
-codex-docker           # starts OpenAI Codex
-claude-docker-bash     # drops into a shell in the container
-claude-docker-npx ...  # runs npx in the container
+warden claude [args]      # Claude Code, e.g. warden claude --resume
+warden codex [args]       # Codex
+warden opencode [args]    # OpenCode
+warden bash               # shell in the container, all agents available
+warden npx [args]
+warden build [--full]     # update agents; --full rebuilds without cache
+warden --help
 ```
 
-Claude and Codex share a single image. The launcher behaviour is selected by the name it's
-invoked as — `codex-docker`, `claude-docker-bash`, and `claude-docker-npx` are symlinks to
-`claude-docker`, and `codex-docker-build` is a symlink to `claude-docker-build` (either name
-builds the shared image).
+Run it from the project root. Only the current directory is mounted, so from a
+subdirectory git won't find `.git`. The mount is your real files, not a copy: commit
+before you hand over a task.
 
-### Codex authentication
-
-Both tools share the image but keep separate config/auth. Codex stores everything under
-`~/.codex` (mounted rw), so authenticating once persists across runs.
-
-Use the **device-code** flow to sign in with ChatGPT — the default browser flow binds a
-callback on `localhost:1455` inside the container, which the host browser can't reach:
+Don't run an agent from inside this checkout, since it could edit the launcher. To avoid
+that entirely, install a root-owned copy:
 
 ```bash
-codex-docker login --device-auth   # prints a code + URL to open in your browser
+sudo install -d /opt/warden
+sudo install -m 755 warden warden-build /opt/warden/
+sudo install -m 644 Dockerfile config config.in extra-build.sh /opt/warden/
+sudo ln -s /opt/warden/warden /usr/local/bin/warden
 ```
 
-To use an API key instead, uncomment the `-e OPENAI_API_KEY` line in `config` (see
-[Configuration](#configuration)). Note a set `OPENAI_API_KEY` overrides the ChatGPT session.
+## How it works
+
+```
+              you  (fish / bash, inside a project folder)
+                               │
+                               ▼
+          ┌─────────────────────────────────────────┐
+          │  warden                 launcher script │  reads config, checks the
+          │                                         │  folder, picks the mounts
+          └────────────────────┬────────────────────┘
+                               │  docker run --runtime runsc
+                               ▼
+          ┌─────────────────────────────────────────┐
+          │  rootless Docker daemon                 │  runs as your user:
+          │                                         │  container root = your UID
+          └────────────────────┬────────────────────┘
+                               │  starts the container inside gVisor
+                               ▼
+          ┌─────────────────────────────────────────┐
+          │  gVisor sandbox (runsc)                 │  a user-space kernel that
+          │   ┌─────────────────────────────────┐   │  answers the agent's
+          │   │    claude / codex / opencode    │   │  system calls itself
+          │   └─────────────────────────────────┘   │
+          └──────────┬────────────────────┬─────────┘
+                     │                    │
+                     │ file access        │ few, filtered syscalls
+                     ▼                    ▼
+          ┌────────────────────┐  ┌────────────────────┐
+          │  mounted folders   │  │  host Linux kernel │
+          │  project       rw  │  └────────────────────┘
+          │  ~/.claude etc rw  │
+          │  /usr          ro  │
+          └────────────────────┘
+```
+
+gVisor is optional. Without it the container uses runc and talks to the host kernel
+directly. All capabilities are dropped, except `DAC_OVERRIDE` under rootless Docker.
+
+This protects your system, not your project: agents can still edit the project, read
+their own logins and use the network. Keep permission prompts on and use git.
+
+## Mounts
+
+Every run gets the project (rw), `~/.agents` (rw), `/usr` and `/etc/alternatives` (ro),
+and a D-Bus socket limited to desktop notifications.
+
+Each agent only gets its own config and logins:
+
+| Agent | Mounts |
+|---|---|
+| claude | `~/.claude`, `~/.claude.json`, `~/.config/ccstatusline` |
+| codex | `~/.codex` |
+| opencode | `~/.config/opencode`; data, cache and state in `~/.local/share/opencode-docker` etc. |
+| bash, npx | all of the above |
+
+OpenCode shares your host config but keeps its own sessions and logins, so connect
+providers once inside the container.
+
+## Configuration
+
+```bash
+cp config.in config    # optional; config.in is used if config is missing
+```
+
+| Setting | Default | |
+|---|---|---|
+| `DOCKER_CONTEXT` | `rootless` | `default` for rootful Docker |
+| `DOCKER_RUNTIME` | runc | `runsc` for gVisor, `io.containerd.kata.v2` for Kata (rootful only) |
+| `WORK_ROOT` | any folder | only allow launches under this folder |
+| `BASE_IMAGE` | your distro | must match host `/usr` |
+| `EXTRA_DOCKER_ARGS` | | extra `docker run` flags, e.g. a ccache mount |
+
+For one run: `CLAUDE_DOCKER_EXTRA_ARGS='-p 8554:8554' warden claude`. Don't add
+`--privileged`, the Docker socket or your whole home directory.
+
+To add packages to the image, `cp extra-build.sh.in extra-build.sh`, edit it, and run
+`warden build`.
+
+## Rootless Docker
+
+```bash
+sudo apt install uidmap docker-ce-rootless-extras
+dockerd-rootless-setuptool.sh install    # --force if rootful Docker is also running
+sudo loginctl enable-linger "$USER"      # optional, start at boot
+```
+
+This also makes `rootless` your default `docker` context. The two daemons don't share
+images, so run `warden build` again after switching.
+
+## gVisor
+
+```bash
+URL=https://storage.googleapis.com/gvisor/releases/release/latest/$(uname -m)
+wget $URL/gvisor.tar.zstd $URL/gvisor.tar.zstd.sha512
+sha512sum -c gvisor.tar.zstd.sha512
+sudo tar --zstd -xf gvisor.tar.zstd -C /usr/local/bin
+```
+
+`sudo runsc install` only sets up rootful Docker. For rootless, put this in
+`~/.config/docker/daemon.json`:
+
+```json
+{"runtimes": {"runsc": {"path": "/usr/local/bin/runsc", "runtimeArgs": ["--ignore-cgroups"]}}}
+```
+
+Then `systemctl --user restart docker` and set `DOCKER_RUNTIME="runsc"` in `config`.
+`warden bash -c 'uname -r'` should print `4.19.0-gvisor`.
+
+Downsides: builds are several times slower (40 small `gcc` runs: 6.8 s vs 1.4 s),
+notifications don't work, and `docker stats` shows nonsense. Use `ps` instead.
+
+If something fails:
+
+- `unknown or invalid runtime name: runsc`: registered with the other daemon. Check
+  `docker context show`.
+- `Interactive authentication required`: add `--ignore-cgroups`.
+- `pull access denied for claude-docker`: run `warden build` for this daemon.
+
+## Logins
+
+- **Codex**: use `warden codex login --device-auth`. The browser flow can't reach the
+  container's localhost.
+- **OpenCode**: `/connect`, then `/models`. Or set API keys via `config`.
+- The container's `localhost` is not your host's, so local Ollama or MCP servers need
+  explicit networking.
+
+## tmux
+
+Run tmux on the host and `warden <tool>` inside each pane. The tmux socket is not shared
+with the container on purpose. ccstatusline is Claude Code's own status line; customize
+it with `warden bash -c ccstatusline`.
+
+## Credits
+
+Based on [claude-docker](https://github.com/tguillem/claude-docker) by Thomas Guillem.

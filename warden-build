@@ -1,0 +1,37 @@
+#!/bin/bash
+# Build (or rebuild) the claude-docker image; also run as 'warden build'
+#   Default:  update agents (reuses cached OS layers)
+#   --full:   rebuild everything including Debian packages
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+if [[ -f "$SCRIPT_DIR/config" ]]; then
+  source "$SCRIPT_DIR/config"
+else
+  source "$SCRIPT_DIR/config.in"
+fi
+DOCKER_CONTEXT="${DOCKER_CONTEXT:-rootless}"
+docker --context "$DOCKER_CONTEXT" info >/dev/null
+if [[ -z ${BASE_IMAGE:-} ]]; then
+  source /etc/os-release
+  if [[ -n ${UBUNTU_CODENAME:-} ]]; then
+    BASE_IMAGE="ubuntu:$UBUNTU_CODENAME"
+  else
+    BASE_IMAGE="$ID:${VERSION_CODENAME:-$VERSION_ID}"
+  fi
+fi
+BUILD_ARGS=(--build-arg "USER=$(whoami)" --build-arg "UID=$(id -u)" --build-arg "BASE_IMAGE=$BASE_IMAGE")
+
+[[ -f "$SCRIPT_DIR/extra-build.sh" ]] || printf '#!/bin/bash\n' > "$SCRIPT_DIR/extra-build.sh"
+
+if [[ $# -eq 1 && "$1" == "--full" ]]; then
+  BUILD_ARGS+=(--no-cache)
+elif [[ $# -ne 0 ]]; then
+  echo "Usage: warden build [--full]" >&2
+  exit 1
+else
+  VERSION="$(date +%s)"
+  BUILD_ARGS+=(--build-arg "CLAUDE_VERSION=$VERSION" --build-arg "CODEX_VERSION=$VERSION" --build-arg "OPENCODE_VERSION=$VERSION")
+fi
+docker --context "$DOCKER_CONTEXT" build "${BUILD_ARGS[@]}" -t claude-docker "$SCRIPT_DIR"

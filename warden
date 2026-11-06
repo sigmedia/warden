@@ -1,0 +1,180 @@
+#!/bin/bash
+# warden: run coding agents from Docker in the current working directory
+#   warden claude|codex|opencode|bash|npx [args...]
+#   warden build [--full]
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+usage() {
+  echo "Usage: warden <claude|codex|opencode|bash|npx> [args...]"
+  echo "       warden build [--full]"
+}
+
+help() {
+  local config="$SCRIPT_DIR/config"
+  [[ -f $config ]] || config="$SCRIPT_DIR/config.in"
+  local settings
+  settings="$(source "$config" 2>/dev/null
+    echo "context=${DOCKER_CONTEXT:-rootless}  runtime=${DOCKER_RUNTIME:-runc}")"
+  cat <<EOF
+warden - run coding agents in a Docker sandbox, in the current project folder
+
+$(usage)
+
+Tools (each mounts only its own config and logins):
+  claude      Claude Code      ~/.claude, ~/.claude.json, ~/.config/ccstatusline
+  codex       OpenAI Codex     ~/.codex
+  opencode    OpenCode         ~/.config/opencode, plus container-only data
+  bash        shell            all of the above, to switch agents inside
+  npx         npx              all of the above
+Every run also mounts the project (rw), ~/.agents (rw) and /usr (ro).
+
+Examples:
+  warden claude --resume
+  warden codex login --device-auth
+  warden opencode run "explain this project"
+  warden bash -c 'make test'
+  warden build --full          rebuild without cache
+
+Settings: $settings
+  from $config
+EOF
+}
+
+TOOL="${1:-}"
+[[ $# -eq 0 ]] || shift
+case "$TOOL" in
+  claude|codex|opencode) CMD=(); set -- "$TOOL" "$@" ;;
+  bash|npx) CMD=(--entrypoint "$TOOL") ;;
+  build) exec "$SCRIPT_DIR/warden-build" "$@" ;;
+  -h|--help|help) help; exit 0 ;;
+  *) { usage; echo "Run 'warden --help' for details."; } >&2; exit 1 ;;
+esac
+
+if [[ -f "$SCRIPT_DIR/config" ]]; then
+  source "$SCRIPT_DIR/config"
+else
+  source "$SCRIPT_DIR/config.in"
+fi
+
+# Check current directory is under WORK_ROOT
+WORK_ROOT="$(realpath -e "$WORK_ROOT")"
+WORK_DIR="$(pwd -P)"
+if [[ "$WORK_DIR" == / || "$WORK_DIR" == "$(realpath -e "$HOME")" ]]; then
+  echo "Error: choose a project directory, not / or your home directory" >&2
+  exit 1
+fi
+if [[ "$WORK_DIR" != "$WORK_ROOT" && "$WORK_DIR" != "${WORK_ROOT%/}/"* ]]; then
+  echo "Error: must be run from within $WORK_ROOT" >&2
+  exit 1
+fi
+
+# Rootless container root maps to the host user; rootful Docker needs our UID.
+DOCKER_CONTEXT="${DOCKER_CONTEXT:-rootless}"
+SECURITY_OPTIONS="$(docker --context "$DOCKER_CONTEXT" info --format '{{json .SecurityOptions}}')"
+CONTAINER_USER="$(id -u):$(id -g)"
+CAP_ARGS=(--cap-drop ALL)
+if [[ "$SECURITY_OPTIONS" == *rootless* ]]; then
+  # Container root must still read the image's UID-owned home (mode 750). Inside
+  # the user namespace this only applies to files owned by mapped IDs.
+  CONTAINER_USER=0:0
+  CAP_ARGS+=(--cap-add DAC_OVERRIDE)
+fi
+
+# Mount /etc/alternatives if it exists (Debian/Ubuntu symlinks used by /usr binaries)
+ALTERNATIVES=()
+[[ -d /etc/alternatives ]] && ALTERNATIVES=(-v /etc/alternatives:/etc/alternatives:ro)
+
+# Mount only the selected agent's config and credentials, so one agent cannot read
+# another's login; bash and npx get all of them to allow switching inside.
+# Create mount sources first so Docker doesn't create them as root-owned directories.
+uses() { [[ $TOOL == "$1" || $TOOL == bash || $TOOL == npx ]]; }
+mkdir -p "$HOME/.agents"
+AGENT_ARGS=(-v "$HOME/.agents:$HOME/.agents")
+if uses claude; then
+  mkdir -p "$HOME/.claude" "$HOME/.config/ccstatusline"
+  [[ -f "$HOME/.claude.json" ]] || touch "$HOME/.claude.json"
+  AGENT_ARGS+=(
+    -v "$HOME/.claude:$HOME/.claude"
+    -v "$HOME/.claude.json:$HOME/.claude.json"
+    -v "$HOME/.config/ccstatusline:$HOME/.config/ccstatusline"
+  )
+fi
+if uses codex; then
+  mkdir -p "$HOME/.codex"
+  AGENT_ARGS+=(-v "$HOME/.codex:$HOME/.codex")
+fi
+if uses opencode; then
+  # Keep the host service registration and live database out of the container.
+  for entry in CONFIG:.config DATA:.local/share CACHE:.cache STATE:.local/state; do
+    name="XDG_${entry%%:*}_HOME"
+    directory="${!name:-$HOME/${entry#*:}}"
+    target="$directory/opencode"
+    source="$target"
+    [[ "$name" == XDG_CONFIG_HOME ]] || source="$directory/opencode-docker"
+    mkdir -p "$source"
+    AGENT_ARGS+=(-e "$name=$directory" -v "$source:$target")
+  done
+fi
+
+# D-Bus: expose only desktop notifications from the host session bus, through a
+# filtering proxy. The full bus would let the container run host commands
+# (systemd --user, Flatpak HostCommand) and read the keyring. Use scoped
+# --call/--broadcast rules, not --talk: --talk opens every object on the
+# notification server's connection, which some desktops share with other services.
+DBUS_DOCKER_ARGS=()
+if [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] && command -v xdg-dbus-proxy >/dev/null &&
+   DBUS_PROXY_DIR="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/claude-docker-dbus.XXXXXX")"; then
+  trap 'rm -rf "$DBUS_PROXY_DIR"' EXIT
+  # The proxy writes one byte to the pipe when ready, and exits once this
+  # script (and docker) close the read end.
+  exec {DBUS_PROXY_FD}< <(exec xdg-dbus-proxy --fd=1 \
+    "$DBUS_SESSION_BUS_ADDRESS" "$DBUS_PROXY_DIR/bus" \
+    --filter \
+    --call=org.freedesktop.Notifications=org.freedesktop.Notifications.*@/org/freedesktop/Notifications \
+    --broadcast=org.freedesktop.Notifications=org.freedesktop.Notifications.*@/org/freedesktop/Notifications)
+  if read -r -n 1 -t 5 -u "$DBUS_PROXY_FD" && [[ -S $DBUS_PROXY_DIR/bus ]]; then
+    DBUS_DOCKER_ARGS=(
+      -v "$DBUS_PROXY_DIR/bus:/run/user/$(id -u)/bus"
+      -e "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus"
+    )
+  else
+    exec {DBUS_PROXY_FD}<&-
+    echo "Warning: xdg-dbus-proxy did not start; desktop notifications disabled" >&2
+  fi
+fi
+
+# Per-run Docker options. Split on whitespace without evaluating shell syntax.
+ENV_DOCKER_ARGS=()
+if [[ -n ${CLAUDE_DOCKER_EXTRA_ARGS:-} ]]; then
+  if [[ $CLAUDE_DOCKER_EXTRA_ARGS == *$'\n'* ]]; then
+    echo "Error: CLAUDE_DOCKER_EXTRA_ARGS must be a single line" >&2
+    exit 1
+  fi
+  IFS=$' \t\n' read -r -a ENV_DOCKER_ARGS <<< "$CLAUDE_DOCKER_EXTRA_ARGS"
+fi
+
+# Optional OCI runtime, e.g. DOCKER_RUNTIME=runsc for gVisor.
+RUNTIME_ARGS=()
+[[ -z ${DOCKER_RUNTIME:-} ]] || RUNTIME_ARGS=(--runtime "$DOCKER_RUNTIME")
+
+TTY_ARGS=(-i)
+[[ ! -t 0 || ! -t 1 ]] || TTY_ARGS+=(-t)
+
+docker --context "$DOCKER_CONTEXT" run "${RUNTIME_ARGS[@]}" "${TTY_ARGS[@]}" --rm --security-opt no-new-privileges "${CAP_ARGS[@]}" \
+  --user "$CONTAINER_USER" \
+  -e HOME="$HOME" \
+  -e TERM="${TERM:-xterm-256color}" \
+  -e COLORTERM \
+  -e IS_SANDBOX=1 \
+  -w "$WORK_DIR" \
+  -v "$WORK_DIR:$WORK_DIR" \
+  "${AGENT_ARGS[@]}" \
+  -v /usr:/usr:ro \
+  "${ALTERNATIVES[@]}" \
+  "${DBUS_DOCKER_ARGS[@]}" \
+  "${EXTRA_DOCKER_ARGS[@]}" \
+  "${ENV_DOCKER_ARGS[@]}" \
+  "${CMD[@]}" claude-docker "$@"

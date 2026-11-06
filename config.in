@@ -1,22 +1,35 @@
 # Copy this file to 'config' and edit
 # 'config' is gitignored
 
-# Root directory that gets mounted read-write into the container.
-# claude-docker refuses to run outside this path.
-WORK_ROOT="$HOME/work"
+# Only the current directory is mounted read-write. Start at your project root.
+# Optionally restrict launches to a parent directory, e.g. "$HOME/work".
+WORK_ROOT="${WORK_ROOT:-$PWD}"
+
+# Keep rootless as the default. Set "default" to opt into rootful Docker;
+# the launcher then runs with your host UID/GID instead of container root.
+DOCKER_CONTEXT="${DOCKER_CONTEXT:-rootless}"
+
+# Optional OCI runtime registered with the Docker daemon, e.g. "runsc" for gVisor
+# (a user-space kernel between agents and the host kernel). Empty uses runc.
+# DOCKER_RUNTIME="runsc"
+
+# Optional base-image override. Ubuntu derivatives use their Ubuntu codename.
+# BASE_IMAGE="ubuntu:jammy"
 
 # Extra arguments passed to 'docker run'.
 # Add or remove -v (mounts) and -e (env vars) to suit your setup.
 EXTRA_DOCKER_ARGS=(
-  # ccstatusline: share tmux/screen status bar config with host
-  # -v "$HOME/.config/ccstatusline:$HOME/.config/ccstatusline"
-
   # ccache: share compiler cache with host to speed up rebuilds
   # -v "$HOME/.cache/ccache:$HOME/.cache/ccache"
   # -e CCACHE_PATH="/usr/bin"
 
-  # Codex API-key auth: forward OPENAI_API_KEY for `codex-docker`.
+  # Codex API-key auth: forward OPENAI_API_KEY for `warden codex`.
   # Leave commented if you sign in with ChatGPT (that auth lives in ~/.codex,
   # which is always mounted) — a set key overrides the ChatGPT session.
   # -e OPENAI_API_KEY
+
+  # OpenCode: optional provider API keys (or use /connect in the container).
+  # -e ANTHROPIC_API_KEY
+  # -e OPENAI_API_KEY
+  # -e OPENROUTER_API_KEY
 )
