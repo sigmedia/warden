@@ -98,6 +98,10 @@ their own logins and use the network. Keep permission prompts on and use git.
 Every run gets the project (rw), `~/.agents` (rw), `/usr` and `/etc/alternatives` (ro),
 and a D-Bus socket limited to desktop notifications.
 
+If uv is installed, it is mounted too: the binaries (ro), `~/.local/share/uv` and
+`~/.cache/uv` (rw), and `~/.config/uv` (ro). Paths match the host, so a project `.venv`
+made on the host works inside. The rest of `~/.local` is not mounted.
+
 Each agent only gets its own config and logins:
 
 | Agent | Mounts |
@@ -120,6 +124,8 @@ Options go before the tool. `warden build` takes its own.
 | `--runtime` | `runc` | `runsc` for gVisor, `io.containerd.kata.v2` for Kata (native only) |
 | `--work-root DIR` | any folder | only allow launches under this folder |
 | `--docker-args 'FLAGS'` | | extra `docker run` flags, repeatable, split on spaces |
+| `--gpu` | off | pass NVIDIA and `/dev/dri` devices; always runs with runc |
+| `--uv`, `--no-uv` | on if installed | mount host uv, its Pythons and cache |
 | `build --full` | | rebuild without cache |
 | `build --base-image IMAGE` | your distro | must match host `/usr` |
 
@@ -132,6 +138,12 @@ warden --docker-args '-v /home/me/.cache/ccache:/home/me/.cache/ccache' bash
 
 Don't pass `--privileged`, the Docker socket or your whole home directory.
 To add packages, `cp extra-build.sh.in extra-build.sh`, edit it, and run `warden build`.
+
+## GPU
+
+`warden --gpu claude` passes `/dev/nvidia*` and `/dev/dri`. The NVIDIA driver libraries
+and `nvidia-smi` come from the host's `/usr`, so no NVIDIA container toolkit is needed.
+gVisor can't use this GPU driver, so `--gpu` always runs with runc.
 
 ## Rootless Docker
 

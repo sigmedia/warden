@@ -11,6 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 DEFAULT_CONTEXT=rootless   # --context: rootless | native
 DEFAULT_RUNTIME=runc       # --runtime: runc | runsc (gVisor)
 DEFAULT_WORK_ROOT=""       # --work-root: empty allows any folder
+DEFAULT_GPU=""             # --gpu: set to 1 to always pass GPU devices
+DEFAULT_UV=1               # --uv / --no-uv: mount host uv (skipped if not installed)
 
 usage() {
   echo "Usage: warden [options] <claude|codex|opencode|bash|npx> [args...]"
@@ -41,6 +43,9 @@ Options:
   --work-root DIR             only allow launches under DIR (default: ${DEFAULT_WORK_ROOT:-any folder})
   --docker-args 'FLAGS'       extra docker run flags, e.g. '-e OPENAI_API_KEY'
                               (repeatable; split on spaces, no shell quoting)
+  --gpu                       pass NVIDIA and /dev/dri devices; always uses runc
+  --uv, --no-uv               mount host uv, its Pythons and cache: ~/.local/share/uv,
+                              ~/.cache/uv, ~/.config/uv (ro) (default: on if installed)
 
 Examples:
   warden claude --resume
@@ -57,18 +62,22 @@ set_opt() {
   [[ -n $2 ]] || { echo "Error: $1 needs a value" >&2; exit 1; }
   case $1 in
     --context) DOCKER_CONTEXT="$2" ;;
-    --runtime) DOCKER_RUNTIME="$2" ;;
+    --runtime) DOCKER_RUNTIME="$2"; RUNTIME_SET=1 ;;
     --work-root) WORK_ROOT="$2" ;;
     --docker-args) DOCKER_ARGS+=" $2" ;;
   esac
 }
 
 DOCKER_CONTEXT="$DEFAULT_CONTEXT" DOCKER_RUNTIME="$DEFAULT_RUNTIME" WORK_ROOT="$DEFAULT_WORK_ROOT"
+GPU="$DEFAULT_GPU" UV="$DEFAULT_UV" RUNTIME_SET=""
 DOCKER_ARGS="${CLAUDE_DOCKER_EXTRA_ARGS:-}"
 while [[ $# -gt 0 ]]; do
   case $1 in
     --context|--runtime|--work-root|--docker-args) set_opt "$1" "${2:-}"; shift 2 ;;
     --context=*|--runtime=*|--work-root=*|--docker-args=*) set_opt "${1%%=*}" "${1#*=}"; shift ;;
+    --gpu) GPU=1; shift ;;
+    --uv) UV=required; shift ;;
+    --no-uv) UV=""; shift ;;
     --) shift; break ;;
     *) break ;;
   esac
@@ -172,6 +181,52 @@ if [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] && command -v xdg-dbus-proxy >/dev/nul
   fi
 fi
 
+# GPU: host /usr already provides the driver libraries, so only the device nodes
+# are needed. gVisor's nvproxy supports a fixed list of drivers, so GPU runs use
+# runc even when gVisor is the default.
+GPU_ARGS=()
+if [[ -n $GPU ]]; then
+  if [[ $DOCKER_RUNTIME == runsc ]]; then
+    if [[ -n $RUNTIME_SET ]]; then
+      echo "Error: --gpu does not work with --runtime runsc" >&2
+      exit 1
+    fi
+    echo "Note: --gpu runs with runc, not gVisor" >&2
+    DOCKER_RUNTIME=runc
+  fi
+  for dev in /dev/nvidia* /dev/dri; do
+    if [[ -c $dev || -d $dev ]]; then GPU_ARGS+=(--device "$dev"); fi
+  done
+  if [[ ${#GPU_ARGS[@]} -eq 0 ]]; then
+    echo "Error: --gpu: no GPU devices found" >&2
+    exit 1
+  fi
+fi
+
+# uv: binaries read-only, Pythons and cache read-write at the same paths, so a
+# project .venv created on the host keeps working. Not all of ~/.local: that
+# would hide the agents in the image and expose other apps' data.
+UV_ARGS=()
+if [[ -n $UV ]] && ! UV_BIN="$(command -v uv)"; then
+  if [[ $UV == required ]]; then
+    echo "Error: --uv: uv not found on the host" >&2
+    exit 1
+  fi
+  UV=""
+fi
+if [[ -n $UV ]]; then
+  UV_DIR="$(dirname "$(readlink -f "$UV_BIN")")"
+  for bin in uv uvx; do
+    if [[ -x $UV_DIR/$bin ]]; then UV_ARGS+=(-v "$UV_DIR/$bin:$HOME/.local/bin/$bin:ro"); fi
+  done
+  mkdir -p "$HOME/.local/share/uv" "$HOME/.cache/uv" "$HOME/.config/uv"
+  UV_ARGS+=(
+    -v "$HOME/.local/share/uv:$HOME/.local/share/uv"
+    -v "$HOME/.cache/uv:$HOME/.cache/uv"
+    -v "$HOME/.config/uv:$HOME/.config/uv:ro"
+  )
+fi
+
 # Extra docker run flags from --docker-args and CLAUDE_DOCKER_EXTRA_ARGS.
 # Split on whitespace without evaluating shell syntax.
 ENV_DOCKER_ARGS=()
@@ -200,5 +255,7 @@ docker --context "$DOCKER_CONTEXT" run "${RUNTIME_ARGS[@]}" "${TTY_ARGS[@]}" --r
   -v /usr:/usr:ro \
   "${ALTERNATIVES[@]}" \
   "${DBUS_DOCKER_ARGS[@]}" \
+  "${GPU_ARGS[@]}" \
+  "${UV_ARGS[@]}" \
   "${ENV_DOCKER_ARGS[@]}" \
   "${CMD[@]}" claude-docker "$@"
