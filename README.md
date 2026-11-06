@@ -27,6 +27,14 @@ warden build [--full]     # update agents; --full rebuilds without cache
 warden --help
 ```
 
+Options go before the tool:
+
+```bash
+warden --runtime runsc claude             # run inside gVisor
+warden --context native claude            # use Docker's system (root) daemon
+warden --work-root ~/work claude          # only allow launches under ~/work
+```
+
 Run it from the project root. Only the current directory is mounted, so from a
 subdirectory git won't find `.git`. The mount is your real files, not a copy: commit
 before you hand over a task.
@@ -37,18 +45,21 @@ that entirely, install a root-owned copy:
 ```bash
 sudo install -d /opt/warden
 sudo install -m 755 warden warden-build /opt/warden/
-sudo install -m 644 Dockerfile config config.in extra-build.sh /opt/warden/
+sudo install -m 644 Dockerfile extra-build.sh /opt/warden/
 sudo ln -s /opt/warden/warden /usr/local/bin/warden
 ```
 
 ## How it works
+
+This shows a run with `--runtime runsc` (gVisor). By default warden uses plain runc,
+which skips the gVisor box.
 
 ```
               you  (fish / bash, inside a project folder)
                                │
                                ▼
           ┌─────────────────────────────────────────┐
-          │  warden                 launcher script │  reads config, checks the
+          │  warden                 launcher script │  reads options, checks the
           │                                         │  folder, picks the mounts
           └────────────────────┬────────────────────┘
                                │  docker run --runtime runsc
@@ -76,8 +87,8 @@ sudo ln -s /opt/warden/warden /usr/local/bin/warden
           └────────────────────┘
 ```
 
-gVisor is optional. Without it the container uses runc and talks to the host kernel
-directly. All capabilities are dropped, except `DAC_OVERRIDE` under rootless Docker.
+With the default runc, the container talks to the host kernel directly. All
+capabilities are dropped, except `DAC_OVERRIDE` under rootless Docker.
 
 This protects your system, not your project: agents can still edit the project, read
 their own logins and use the network. Keep permission prompts on and use git.
@@ -99,25 +110,28 @@ Each agent only gets its own config and logins:
 OpenCode shares your host config but keeps its own sessions and logins, so connect
 providers once inside the container.
 
-## Configuration
+## Options
+
+Options go before the tool. `warden build` takes its own.
+
+| Option | Default | |
+|---|---|---|
+| `--context` | `rootless` | Docker daemon: `rootless` (per-user) or `native` (system, root) |
+| `--runtime` | `runc` | `runsc` for gVisor, `io.containerd.kata.v2` for Kata (native only) |
+| `--work-root DIR` | any folder | only allow launches under this folder |
+| `--docker-args 'FLAGS'` | | extra `docker run` flags, repeatable, split on spaces |
+| `build --full` | | rebuild without cache |
+| `build --base-image IMAGE` | your distro | must match host `/usr` |
+
+To change a default, edit the `DEFAULT_*` lines at the top of `warden`.
 
 ```bash
-cp config.in config    # optional; config.in is used if config is missing
+warden --docker-args '-e OPENAI_API_KEY' codex
+warden --docker-args '-v /home/me/.cache/ccache:/home/me/.cache/ccache' bash
 ```
 
-| Setting | Default | |
-|---|---|---|
-| `DOCKER_CONTEXT` | `rootless` | `default` for rootful Docker |
-| `DOCKER_RUNTIME` | runc | `runsc` for gVisor, `io.containerd.kata.v2` for Kata (rootful only) |
-| `WORK_ROOT` | any folder | only allow launches under this folder |
-| `BASE_IMAGE` | your distro | must match host `/usr` |
-| `EXTRA_DOCKER_ARGS` | | extra `docker run` flags, e.g. a ccache mount |
-
-For one run: `CLAUDE_DOCKER_EXTRA_ARGS='-p 8554:8554' warden claude`. Don't add
-`--privileged`, the Docker socket or your whole home directory.
-
-To add packages to the image, `cp extra-build.sh.in extra-build.sh`, edit it, and run
-`warden build`.
+Don't pass `--privileged`, the Docker socket or your whole home directory.
+To add packages, `cp extra-build.sh.in extra-build.sh`, edit it, and run `warden build`.
 
 ## Rootless Docker
 
@@ -146,11 +160,13 @@ sudo tar --zstd -xf gvisor.tar.zstd -C /usr/local/bin
 {"runtimes": {"runsc": {"path": "/usr/local/bin/runsc", "runtimeArgs": ["--ignore-cgroups"]}}}
 ```
 
-Then `systemctl --user restart docker` and set `DOCKER_RUNTIME="runsc"` in `config`.
-`warden bash -c 'uname -r'` should print `4.19.0-gvisor`.
+Then `systemctl --user restart docker` and use `warden --runtime runsc ...`, or set
+`DEFAULT_RUNTIME=runsc` in `warden`. `warden --runtime runsc bash -c 'uname -r'` should
+print `4.19.0-gvisor`.
 
 Downsides: builds are several times slower (40 small `gcc` runs: 6.8 s vs 1.4 s),
 notifications don't work, and `docker stats` shows nonsense. Use `ps` instead.
+If gVisor is your default, skip it for a heavy build with `warden --runtime runc`.
 
 If something fails:
 
@@ -163,7 +179,7 @@ If something fails:
 
 - **Codex**: use `warden codex login --device-auth`. The browser flow can't reach the
   container's localhost.
-- **OpenCode**: `/connect`, then `/models`. Or set API keys via `config`.
+- **OpenCode**: `/connect`, then `/models`. Or pass API keys with `--docker-args '-e ANTHROPIC_API_KEY'`.
 - The container's `localhost` is not your host's, so local Ollama or MCP servers need
   explicit networking.
 

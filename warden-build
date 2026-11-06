@@ -2,18 +2,29 @@
 # Build (or rebuild) the claude-docker image; also run as 'warden build'
 #   Default:  update agents (reuses cached OS layers)
 #   --full:   rebuild everything including Debian packages
+#   --base-image IMAGE: override the detected base image (must match host /usr)
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-if [[ -f "$SCRIPT_DIR/config" ]]; then
-  source "$SCRIPT_DIR/config"
-else
-  source "$SCRIPT_DIR/config.in"
-fi
-DOCKER_CONTEXT="${DOCKER_CONTEXT:-rootless}"
+DOCKER_CONTEXT="${WARDEN_DOCKER_CONTEXT:-rootless}"
+[[ $DOCKER_CONTEXT != native ]] || DOCKER_CONTEXT=default
+
+FULL="" BASE_IMAGE=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --full) FULL=1; shift ;;
+    --base-image)
+      [[ -n ${2:-} ]] || { echo "Error: --base-image needs a value" >&2; exit 1; }
+      BASE_IMAGE="$2"; shift 2 ;;
+    --base-image=?*) BASE_IMAGE="${1#*=}"; shift ;;
+    *) echo "Usage: warden build [--full] [--base-image IMAGE]" >&2; exit 1 ;;
+  esac
+done
+
 docker --context "$DOCKER_CONTEXT" info >/dev/null
-if [[ -z ${BASE_IMAGE:-} ]]; then
+# The base image must match the host, whose /usr is mounted into the container.
+if [[ -z $BASE_IMAGE ]]; then
   source /etc/os-release
   if [[ -n ${UBUNTU_CODENAME:-} ]]; then
     BASE_IMAGE="ubuntu:$UBUNTU_CODENAME"
@@ -25,11 +36,8 @@ BUILD_ARGS=(--build-arg "USER=$(whoami)" --build-arg "UID=$(id -u)" --build-arg 
 
 [[ -f "$SCRIPT_DIR/extra-build.sh" ]] || printf '#!/bin/bash\n' > "$SCRIPT_DIR/extra-build.sh"
 
-if [[ $# -eq 1 && "$1" == "--full" ]]; then
+if [[ -n $FULL ]]; then
   BUILD_ARGS+=(--no-cache)
-elif [[ $# -ne 0 ]]; then
-  echo "Usage: warden build [--full]" >&2
-  exit 1
 else
   VERSION="$(date +%s)"
   BUILD_ARGS+=(--build-arg "CLAUDE_VERSION=$VERSION" --build-arg "CODEX_VERSION=$VERSION" --build-arg "OPENCODE_VERSION=$VERSION")

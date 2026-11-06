@@ -1,23 +1,23 @@
 #!/bin/bash
 # warden: run coding agents from Docker in the current working directory
-#   warden claude|codex|opencode|bash|npx [args...]
-#   warden build [--full]
+#   warden [options] claude|codex|opencode|bash|npx [args...]
+#   warden [--context NAME] build [--full] [--base-image IMAGE]
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
+# Defaults, used when the matching option is not given. Edit to change them.
+DEFAULT_CONTEXT=rootless   # --context: rootless | native
+DEFAULT_RUNTIME=runc       # --runtime: runc | runsc (gVisor)
+DEFAULT_WORK_ROOT=""       # --work-root: empty allows any folder
+
 usage() {
-  echo "Usage: warden <claude|codex|opencode|bash|npx> [args...]"
-  echo "       warden build [--full]"
+  echo "Usage: warden [options] <claude|codex|opencode|bash|npx> [args...]"
+  echo "       warden [--context NAME] build [--full] [--base-image IMAGE]"
 }
 
 help() {
-  local config="$SCRIPT_DIR/config"
-  [[ -f $config ]] || config="$SCRIPT_DIR/config.in"
-  local settings
-  settings="$(source "$config" 2>/dev/null
-    echo "context=${DOCKER_CONTEXT:-rootless}  runtime=${DOCKER_RUNTIME:-runc}")"
   cat <<EOF
 warden - run coding agents in a Docker sandbox, in the current project folder
 
@@ -31,36 +31,63 @@ Tools (each mounts only its own config and logins):
   npx         npx              all of the above
 Every run also mounts the project (rw), ~/.agents (rw) and /usr (ro).
 
+Options:
+  --context rootless|native   Docker daemon (default: $DEFAULT_CONTEXT)
+                                rootless  your per-user daemon, no root
+                                native    Docker's system daemon, runs as root
+  --runtime runc|runsc        container runtime (default: $DEFAULT_RUNTIME)
+                                runc      plain Docker
+                                runsc     gVisor sandbox, slower but more isolated
+  --work-root DIR             only allow launches under DIR (default: ${DEFAULT_WORK_ROOT:-any folder})
+  --docker-args 'FLAGS'       extra docker run flags, e.g. '-e OPENAI_API_KEY'
+                              (repeatable; split on spaces, no shell quoting)
+
 Examples:
   warden claude --resume
+  warden --runtime runsc claude      run inside gVisor
   warden codex login --device-auth
   warden opencode run "explain this project"
-  warden bash -c 'make test'
+  warden --docker-args '-p 8080:8080' bash
   warden build --full          rebuild without cache
-
-Settings: $settings
-  from $config
+  warden build --base-image debian:bookworm
 EOF
 }
+
+set_opt() {
+  [[ -n $2 ]] || { echo "Error: $1 needs a value" >&2; exit 1; }
+  case $1 in
+    --context) DOCKER_CONTEXT="$2" ;;
+    --runtime) DOCKER_RUNTIME="$2" ;;
+    --work-root) WORK_ROOT="$2" ;;
+    --docker-args) DOCKER_ARGS+=" $2" ;;
+  esac
+}
+
+DOCKER_CONTEXT="$DEFAULT_CONTEXT" DOCKER_RUNTIME="$DEFAULT_RUNTIME" WORK_ROOT="$DEFAULT_WORK_ROOT"
+DOCKER_ARGS="${CLAUDE_DOCKER_EXTRA_ARGS:-}"
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --context|--runtime|--work-root|--docker-args) set_opt "$1" "${2:-}"; shift 2 ;;
+    --context=*|--runtime=*|--work-root=*|--docker-args=*) set_opt "${1%%=*}" "${1#*=}"; shift ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+# "native" is Docker's own system daemon, which Docker calls "default".
+[[ $DOCKER_CONTEXT != native ]] || DOCKER_CONTEXT=default
 
 TOOL="${1:-}"
 [[ $# -eq 0 ]] || shift
 case "$TOOL" in
   claude|codex|opencode) CMD=(); set -- "$TOOL" "$@" ;;
   bash|npx) CMD=(--entrypoint "$TOOL") ;;
-  build) exec "$SCRIPT_DIR/warden-build" "$@" ;;
+  build) WARDEN_DOCKER_CONTEXT="$DOCKER_CONTEXT" exec "$SCRIPT_DIR/warden-build" "$@" ;;
   -h|--help|help) help; exit 0 ;;
   *) { usage; echo "Run 'warden --help' for details."; } >&2; exit 1 ;;
 esac
 
-if [[ -f "$SCRIPT_DIR/config" ]]; then
-  source "$SCRIPT_DIR/config"
-else
-  source "$SCRIPT_DIR/config.in"
-fi
-
-# Check current directory is under WORK_ROOT
-WORK_ROOT="$(realpath -e "$WORK_ROOT")"
+# Check current directory is under WORK_ROOT (default: any folder)
+WORK_ROOT="$(realpath -e "${WORK_ROOT:-$PWD}")"
 WORK_DIR="$(pwd -P)"
 if [[ "$WORK_DIR" == / || "$WORK_DIR" == "$(realpath -e "$HOME")" ]]; then
   echo "Error: choose a project directory, not / or your home directory" >&2
@@ -72,7 +99,6 @@ if [[ "$WORK_DIR" != "$WORK_ROOT" && "$WORK_DIR" != "${WORK_ROOT%/}/"* ]]; then
 fi
 
 # Rootless container root maps to the host user; rootful Docker needs our UID.
-DOCKER_CONTEXT="${DOCKER_CONTEXT:-rootless}"
 SECURITY_OPTIONS="$(docker --context "$DOCKER_CONTEXT" info --format '{{json .SecurityOptions}}')"
 CONTAINER_USER="$(id -u):$(id -g)"
 CAP_ARGS=(--cap-drop ALL)
@@ -146,17 +172,16 @@ if [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] && command -v xdg-dbus-proxy >/dev/nul
   fi
 fi
 
-# Per-run Docker options. Split on whitespace without evaluating shell syntax.
+# Extra docker run flags from --docker-args and CLAUDE_DOCKER_EXTRA_ARGS.
+# Split on whitespace without evaluating shell syntax.
 ENV_DOCKER_ARGS=()
-if [[ -n ${CLAUDE_DOCKER_EXTRA_ARGS:-} ]]; then
-  if [[ $CLAUDE_DOCKER_EXTRA_ARGS == *$'\n'* ]]; then
-    echo "Error: CLAUDE_DOCKER_EXTRA_ARGS must be a single line" >&2
-    exit 1
-  fi
-  IFS=$' \t\n' read -r -a ENV_DOCKER_ARGS <<< "$CLAUDE_DOCKER_EXTRA_ARGS"
+if [[ $DOCKER_ARGS == *$'\n'* ]]; then
+  echo "Error: --docker-args and CLAUDE_DOCKER_EXTRA_ARGS must be a single line" >&2
+  exit 1
 fi
+IFS=$' \t' read -r -a ENV_DOCKER_ARGS <<< "$DOCKER_ARGS"
 
-# Optional OCI runtime, e.g. DOCKER_RUNTIME=runsc for gVisor.
+# Container runtime from --runtime (runc, or runsc for gVisor).
 RUNTIME_ARGS=()
 [[ -z ${DOCKER_RUNTIME:-} ]] || RUNTIME_ARGS=(--runtime "$DOCKER_RUNTIME")
 
@@ -175,6 +200,5 @@ docker --context "$DOCKER_CONTEXT" run "${RUNTIME_ARGS[@]}" "${TTY_ARGS[@]}" --r
   -v /usr:/usr:ro \
   "${ALTERNATIVES[@]}" \
   "${DBUS_DOCKER_ARGS[@]}" \
-  "${EXTRA_DOCKER_ARGS[@]}" \
   "${ENV_DOCKER_ARGS[@]}" \
   "${CMD[@]}" claude-docker "$@"
