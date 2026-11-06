@@ -5,6 +5,10 @@
 
 set -e
 
+# Parse the whole script before running it, so editing warden while a session is
+# open cannot change what the running copy does when the agent exits.
+{
+
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
 # Defaults, used when the matching option is not given. Edit to change them.
@@ -259,3 +263,5 @@ docker --context "$DOCKER_CONTEXT" run "${RUNTIME_ARGS[@]}" "${TTY_ARGS[@]}" --r
   "${UV_ARGS[@]}" \
   "${ENV_DOCKER_ARGS[@]}" \
   "${CMD[@]}" claude-docker "$@"
+exit
+}

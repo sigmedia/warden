@@ -6,6 +6,9 @@
 
 set -e
 
+# Parse the whole script first, so editing it during a build is safe.
+{
+
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 DOCKER_CONTEXT="${WARDEN_DOCKER_CONTEXT:-rootless}"
 [[ $DOCKER_CONTEXT != native ]] || DOCKER_CONTEXT=default
@@ -43,3 +46,5 @@ else
   BUILD_ARGS+=(--build-arg "CLAUDE_VERSION=$VERSION" --build-arg "CODEX_VERSION=$VERSION" --build-arg "OPENCODE_VERSION=$VERSION")
 fi
 docker --context "$DOCKER_CONTEXT" build "${BUILD_ARGS[@]}" -t claude-docker "$SCRIPT_DIR"
+exit
+}
