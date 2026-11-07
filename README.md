@@ -114,6 +114,25 @@ Each agent only gets its own config and logins:
 OpenCode shares your host config but keeps its own sessions and logins, so connect
 providers once inside the container.
 
+### Other folders
+
+```bash
+warden --mount ../libfoo claude             # read-only
+warden --mount ~/datasets:rw claude         # read-write
+```
+
+`--mount` is repeatable and mounts each folder at the same path as on the host. To
+mount one on every run, add it to `DEFAULT_MOUNTS` at the top of `warden`.
+
+Symlinks at the top of the project that point outside it (`data -> /mnt/datasets`)
+work too: warden mounts their targets read-write and prints each one. Links deeper in
+the tree are not followed. Links into hidden folders in your home (`~/.ssh`,
+`~/.config`, ...) are skipped, since a cloned repo could contain them; use `--mount` if
+you really want one. `--no-links` turns this off.
+
+`/`, your home directory and its parents are never mounted, and with `--work-root`,
+extra folders must be under it too.
+
 ## Options
 
 Options go before the tool. `warden build` takes its own.
@@ -126,6 +145,8 @@ Options go before the tool. `warden build` takes its own.
 | `--docker-args 'FLAGS'` | | extra `docker run` flags, repeatable, split on spaces |
 | `--gpu` | off | pass NVIDIA and `/dev/dri` devices; always runs with runc |
 | `--uv`, `--no-uv` | on if installed | mount host uv, its Pythons and cache |
+| `--mount PATH[:rw]` | | mount another folder, read-only unless `:rw`; repeatable |
+| `--links`, `--no-links` | on | mount targets of top-level project symlinks |
 | `build --full` | | rebuild without cache |
 | `build --base-image IMAGE` | your distro | must match host `/usr` |
 

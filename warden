@@ -17,6 +17,8 @@ DEFAULT_RUNTIME=runc       # --runtime: runc | runsc (gVisor)
 DEFAULT_WORK_ROOT=""       # --work-root: empty allows any folder
 DEFAULT_GPU=""             # --gpu: set to 1 to always pass GPU devices
 DEFAULT_UV=1               # --uv / --no-uv: mount host uv (skipped if not installed)
+DEFAULT_LINKS=1            # --links / --no-links: mount targets of top-level project symlinks
+DEFAULT_MOUNTS=()          # --mount: always mounted, e.g. ("$HOME/work/shared" "$HOME/data:rw")
 
 usage() {
   echo "Usage: warden [options] <claude|codex|opencode|bash|npx> [args...]"
@@ -50,6 +52,10 @@ Options:
   --gpu                       pass NVIDIA and /dev/dri devices; always uses runc
   --uv, --no-uv               mount host uv, its Pythons and cache: ~/.local/share/uv,
                               ~/.cache/uv, ~/.config/uv (ro) (default: on if installed)
+  --mount PATH[:rw]           also mount PATH at the same path, read-only unless :rw
+                              (repeatable)
+  --links, --no-links         mount the targets of symlinks at the top of the project
+                              that point outside it, read-write (default: on)
 
 Examples:
   warden claude --resume
@@ -57,6 +63,7 @@ Examples:
   warden codex login --device-auth
   warden opencode run "explain this project"
   warden --docker-args '-p 8080:8080' bash
+  warden --mount ../libfoo --mount ~/data:rw claude
   warden build --full          rebuild without cache
   warden build --base-image debian:bookworm
 EOF
@@ -69,19 +76,23 @@ set_opt() {
     --runtime) DOCKER_RUNTIME="$2"; RUNTIME_SET=1 ;;
     --work-root) WORK_ROOT="$2" ;;
     --docker-args) DOCKER_ARGS+=" $2" ;;
+    --mount) MOUNTS+=("$2") ;;
   esac
 }
 
 DOCKER_CONTEXT="$DEFAULT_CONTEXT" DOCKER_RUNTIME="$DEFAULT_RUNTIME" WORK_ROOT="$DEFAULT_WORK_ROOT"
-GPU="$DEFAULT_GPU" UV="$DEFAULT_UV" RUNTIME_SET=""
+GPU="$DEFAULT_GPU" UV="$DEFAULT_UV" LINKS="$DEFAULT_LINKS" RUNTIME_SET=""
+MOUNTS=("${DEFAULT_MOUNTS[@]}")
 DOCKER_ARGS="${CLAUDE_DOCKER_EXTRA_ARGS:-}"
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --context|--runtime|--work-root|--docker-args) set_opt "$1" "${2:-}"; shift 2 ;;
-    --context=*|--runtime=*|--work-root=*|--docker-args=*) set_opt "${1%%=*}" "${1#*=}"; shift ;;
+    --context|--runtime|--work-root|--docker-args|--mount) set_opt "$1" "${2:-}"; shift 2 ;;
+    --context=*|--runtime=*|--work-root=*|--docker-args=*|--mount=*) set_opt "${1%%=*}" "${1#*=}"; shift ;;
     --gpu) GPU=1; shift ;;
     --uv) UV=required; shift ;;
     --no-uv) UV=""; shift ;;
+    --links) LINKS=1; shift ;;
+    --no-links) LINKS=""; shift ;;
     --) shift; break ;;
     *) break ;;
   esac
@@ -100,6 +111,7 @@ case "$TOOL" in
 esac
 
 # Check current directory is under WORK_ROOT (default: any folder)
+LIMIT_TO_ROOT="$WORK_ROOT"
 WORK_ROOT="$(realpath -e "${WORK_ROOT:-$PWD}")"
 WORK_DIR="$(pwd -P)"
 if [[ "$WORK_DIR" == / || "$WORK_DIR" == "$(realpath -e "$HOME")" ]]; then
@@ -231,6 +243,64 @@ if [[ -n $UV ]]; then
   )
 fi
 
+# Extra mounts: --mount paths, and the targets of symlinks at the top of the project
+# that point outside it, so those links also work in the container.
+HOME_REAL="$(realpath -e "$HOME")"
+declare -A MOUNT_AT=()   # container path -> "source:mode"
+under() { [[ $1 == "$2" || $1 == "${2%/}/"* ]]; }
+# Refuse / and home (or any parent of home), and paths outside an explicit --work-root.
+mount_allowed() {
+  local path
+  for path in "$@"; do
+    ! under "$HOME_REAL" "$path" && ! under "$HOME" "$path" || return 1
+    [[ -z $LIMIT_TO_ROOT ]] || under "$path" "$WORK_ROOT" || return 1
+  done
+}
+for spec in "${MOUNTS[@]}"; do
+  path="$spec" mode=ro
+  case $spec in *:ro) path="${spec%:ro}" ;; *:rw) path="${spec%:rw}" mode=rw ;; esac
+  path="${path/#\~/$HOME}"
+  if ! src="$(realpath -e -- "$path" 2>/dev/null)"; then
+    echo "Error: --mount: $path does not exist" >&2
+    exit 1
+  fi
+  if ! mount_allowed "$src"; then
+    echo "Error: --mount: not allowed: $src" >&2
+    exit 1
+  fi
+  MOUNT_AT[$src]="$src:$mode"
+done
+if [[ -n $LINKS ]]; then
+  for link in "$WORK_DIR"/* "$WORK_DIR"/.*; do
+    [[ -L $link ]] || continue
+    # Mount where the link points (without resolving further links), so the
+    # link itself resolves inside the container.
+    target="$(readlink -- "$link")"
+    [[ $target == /* ]] || target="$WORK_DIR/$target"
+    dst="$(realpath -sm -- "$target")"
+    if ! src="$(realpath -e -- "$link" 2>/dev/null)"; then
+      echo "Warning: $link: broken link, not mounted" >&2
+      continue
+    fi
+    # Already visible: inside the project, under the read-only /usr, or mounted.
+    if under "$src" "$WORK_DIR" || under "$dst" "$WORK_DIR" || under "$src" /usr ||
+       [[ -n ${MOUNT_AT[$dst]+x} ]]; then
+      continue
+    fi
+    # A cloned repo can contain links to ~/.ssh and the like: skip hidden home folders.
+    if ! mount_allowed "$src" "$dst" || [[ $src == "$HOME_REAL"/.* || $dst == "$HOME"/.* ]]; then
+      echo "Warning: ${link##*/} -> $src: not mounted (use --mount to allow)" >&2
+      continue
+    fi
+    echo "Mounting link ${link##*/} -> $src (rw)" >&2
+    MOUNT_AT[$dst]="$src:rw"
+  done
+fi
+EXTRA_MOUNT_ARGS=()
+for dst in "${!MOUNT_AT[@]}"; do
+  EXTRA_MOUNT_ARGS+=(-v "${MOUNT_AT[$dst]%:*}:$dst:${MOUNT_AT[$dst]##*:}")
+done
+
 # Extra docker run flags from --docker-args and CLAUDE_DOCKER_EXTRA_ARGS.
 # Split on whitespace without evaluating shell syntax.
 ENV_DOCKER_ARGS=()
@@ -261,6 +331,7 @@ docker --context "$DOCKER_CONTEXT" run "${RUNTIME_ARGS[@]}" "${TTY_ARGS[@]}" --r
   "${DBUS_DOCKER_ARGS[@]}" \
   "${GPU_ARGS[@]}" \
   "${UV_ARGS[@]}" \
+  "${EXTRA_MOUNT_ARGS[@]}" \
   "${ENV_DOCKER_ARGS[@]}" \
   "${CMD[@]}" claude-docker "$@"
 exit
